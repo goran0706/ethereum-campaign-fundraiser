@@ -17,8 +17,10 @@ contract CampaignFundraiser is AccessControl, PullPayment, ReentrancyGuard {
     uint256 public minReviewsRequired;
     uint256 public contributorsCount;
     uint256 public spendingRequestsCount;
+
     bytes32 private constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
     bytes32 private constant REVIEWER_ROLE = keccak256("REVIEWER_ROLE");
+
     mapping(address => uint256) public contributors;
     mapping(uint256 => Request) public requests;
 
@@ -39,10 +41,8 @@ contract CampaignFundraiser is AccessControl, PullPayment, ReentrancyGuard {
         mapping(address => bool) reviews;
     }
 
-    event Contribute(address indexed contributor, uint256 value, uint256 ts);
-
-    event Refund(address indexed contributor, uint256 value, uint256 ts);
-
+    event Contribute(address indexed contributor, uint256 value, uint256 timestamp);
+    event Refund(address indexed contributor, uint256 value, uint256 timestamp);
     event SpendingRequest(
         string description,
         address recipient,
@@ -66,6 +66,7 @@ contract CampaignFundraiser is AccessControl, PullPayment, ReentrancyGuard {
         minFundingGoal = _minFundingGoal;
         minContribution = _minContribution;
         minReviewsRequired = _minReviewsRequired;
+
         _setupRole(MANAGER_ROLE, _manager);
         _setupRole(REVIEWER_ROLE, _reviewer);
     }
@@ -75,33 +76,41 @@ contract CampaignFundraiser is AccessControl, PullPayment, ReentrancyGuard {
         require(timestamp > startsAt, "Campaign has not started yet");
         require(timestamp < endsAt, "Campaign has already ended");
         require(value == msg.value, "Value sent doesn't match the value");
-        require(value >= minContribution, "Minimum contribution value");
+        require(value >= minContribution, "Minimum contribution not met");
 
         address contributor = msg.sender;
 
+        if (contributors[contributor] == 0) {
+            contributorsCount++;
+        }
+
         weiRaised += value;
-        contributorsCount++;
         contributors[contributor] += value;
 
         emit Contribute(contributor, value, timestamp);
     }
 
-    function refund() public {
+    function refund() public nonReentrant {
         uint256 timestamp = block.timestamp;
         require(timestamp > startsAt, "Campaign has not started yet");
-        require(timestamp < endsAt, "Campaign has already ended");
+        require(timestamp < endsAt || weiRaised < minFundingGoal, "Refund not allowed");
         address contributor = msg.sender;
-        require(contributors[contributor] > 0, "No contribution");
+        require(contributors[contributor] > 0, "No contribution to refund");
 
         uint256 value = contributors[contributor];
 
         weiRefunded += value;
+        contributors[contributor] = 0;
         contributorsCount--;
-        contributors[contributor] -= value;
 
         _asyncTransfer(contributor, value);
 
         emit Refund(contributor, value, timestamp);
+    }
+
+    function finalizeCampaign() public {
+        require(block.timestamp > endsAt, "Campaign still in progress");
+        weiPendingBalance = address(this).balance;
     }
 
     function createSpendingRequest(
@@ -111,8 +120,8 @@ contract CampaignFundraiser is AccessControl, PullPayment, ReentrancyGuard {
     ) public {
         require(block.timestamp > endsAt, "Campaign still in progress");
         require(hasRole(MANAGER_ROLE, msg.sender), "Caller is not a manager");
-        require(_recipient != address(0), "Recipient is the zero address");
-        require(_value <= address(this).balance, "Invalid value");
+        require(_recipient != address(0), "Recipient cannot be zero address");
+        require(_value <= weiPendingBalance, "Insufficient funds");
 
         Request storage request = requests[spendingRequestsCount++];
         request.description = _description;
@@ -128,9 +137,10 @@ contract CampaignFundraiser is AccessControl, PullPayment, ReentrancyGuard {
     function rejectSpendingRequest(uint256 requestKey) public {
         address reviewer = msg.sender;
         require(hasRole(REVIEWER_ROLE, reviewer), "Caller is not a reviewer");
+
         Request storage request = requests[requestKey];
-        require(request.status == RequestStatus.PENDING);
-        require(!request.reviews[reviewer], "Already voted");
+        require(request.status == RequestStatus.PENDING, "Request not pending");
+        require(!request.reviews[reviewer], "Reviewer already voted");
 
         request.rejectionsCount++;
         request.reviews[reviewer] = true;
@@ -145,16 +155,17 @@ contract CampaignFundraiser is AccessControl, PullPayment, ReentrancyGuard {
     function acceptSpendingRequest(uint256 requestKey) public {
         address reviewer = msg.sender;
         require(hasRole(REVIEWER_ROLE, reviewer), "Caller is not a reviewer");
+
         Request storage request = requests[requestKey];
-        require(request.status == RequestStatus.PENDING);
-        require(request.value <= weiPendingBalance, "Insufficient funds");
-        require(!request.reviews[reviewer], "Already voted");
+        require(request.status == RequestStatus.PENDING, "Request not pending");
+        require(request.value <= weiPendingBalance, "Insufficient pending funds");
+        require(!request.reviews[reviewer], "Reviewer already voted");
 
         request.approvalsCount++;
         request.reviews[reviewer] = true;
 
         if (request.approvalsCount >= minReviewsRequired) {
-            weiPendingBalance = address(this).balance - request.value;
+            weiPendingBalance -= request.value;
             request.status = RequestStatus.APPROVED;
         }
 
@@ -163,9 +174,10 @@ contract CampaignFundraiser is AccessControl, PullPayment, ReentrancyGuard {
 
     function completeSpendingRequest(uint256 requestKey) public {
         require(hasRole(MANAGER_ROLE, msg.sender), "Caller is not a manager");
+
         Request storage request = requests[requestKey];
-        require(request.status == RequestStatus.APPROVED);
-        require(request.value <= address(this).balance, "Insufficient funds");
+        require(request.status == RequestStatus.APPROVED, "Request not approved");
+        require(request.value <= address(this).balance, "Insufficient balance");
 
         weiSpent += request.value;
         request.status = RequestStatus.COMPLETED;
